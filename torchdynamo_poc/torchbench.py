@@ -28,7 +28,6 @@ import torchdynamo
 import torch_mlir
 import iree_torch
 
-
 COMPILATION_TIMES = []
 COMPILED_ITERATION_TIMES = []
 EAGER_ITERATION_TIMES = []
@@ -95,9 +94,8 @@ def torch_mlir_compiler(fx_graph: torch.fx.GraphModule,
     ts_graph = ts_compiler(fx_graph, example_inputs)
     linalg_module = torch_mlir.compile(ts_graph, example_inputs,
                                        output_type=torch_mlir.OutputType.LINALG_ON_TENSORS)
-    compiled_module = iree_torch.compile_to_vmfb(linalg_module)
-    loaded_module = iree_torch.load_vmfb(compiled_module)
-
+    compiled_module = iree_torch.compile_to_vmfb(linalg_module, target_backend='cuda')
+    loaded_module = iree_torch.load_vmfb(compiled_module, backend='cuda')
     def forward(*inputs):
         result = loaded_module.forward(*inputs)
         result = tuple() if result is None else result
@@ -122,6 +120,7 @@ def check_results(compiled_results, eager_results):
 
 
 def print_time_stats(times, *, warmup_iters: int = 0):
+    print(f"Iterations used for stats calculation: {len(times) - warmup_iters}")
     iter_times = torch.tensor(times[warmup_iters:])
     print(f"Mean: {torch.mean(iter_times.to(float))} ns")
     print(f"STD: {torch.std(iter_times.to(float))} ns")
@@ -143,6 +142,8 @@ def main():
     parser.add_argument("--exit-on-error", action="store_true", help="Exit on compiler error.")
     parser.add_argument("--check-with-eager", action="store_true",
                         help="Verify results with PyTorch eager-mode.")
+    parser.add_argument("--eager", action="store_true",
+                        help="Run the model with PyTorch eager-mode.")
     args = parser.parse_args()
 
     Model = load_model_by_name(args.model)
@@ -154,36 +155,41 @@ def main():
     model = Model(device="cpu", test=test, jit=False, batch_size=args.batchsize)
     print(f"Running model {args.model}")
 
-    def compiler(graph, inputs):
+    def torchdynamo_torch_mlir_compiler(graph, inputs):
+        """
         if args.exit_on_error:
             try:
                 return torch_mlir_compiler(graph, inputs, args.trace)
             except Exception as err:
                 print(err)
                 sys.exit(1)
+        """
         return torch_mlir_compiler(graph, inputs, args.trace)
 
     @timeit(append_time_to=COMPILED_ITERATION_TIMES)
     def run_model_compiled():
-        with torchdynamo.optimize(compiler):
+        with torchdynamo.optimize(torchdynamo_torch_mlir_compiler):
             return list(model.invoke())
 
     total_iters = args.warmup_iters + args.iters
-    compiled_results = run(run_model_compiled, total_iters)
+    if not args.eager:
+        compiled_results = run(run_model_compiled, total_iters)
+        print("Compilation times")
+        print_time_stats(COMPILATION_TIMES)
+        print("Compiled iteration times")
+        print_time_stats(COMPILED_ITERATION_TIMES, warmup_iters=args.warmup_iters)
 
-    print("Compilation times")
-    print_time_stats(COMPILATION_TIMES)
-    print("Compiled iteration times")
-    print_time_stats(COMPILED_ITERATION_TIMES, warmup_iters=args.warmup_iters)
-
-    if args.check_with_eager:
+    if args.eager or args.check_with_eager:
+        model = Model(device="cuda", test=test, jit=False, batch_size=args.batchsize)
         @timeit(append_time_to=EAGER_ITERATION_TIMES)
         def run_model_eager():
-            with torchdynamo.optimize("eager"):
-                return list(model.invoke())
+            #with torchdynamo.optimize("eager"):
+            return list(model.invoke())
         eager_results = run(run_model_eager, total_iters)
         print("Eager iteration times")
         print_time_stats(EAGER_ITERATION_TIMES, warmup_iters=args.warmup_iters)
+
+    if args.check_with_eager:
         check_results(compiled_results, eager_results)
 
 
