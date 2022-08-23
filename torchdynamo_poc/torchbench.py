@@ -28,6 +28,8 @@ import torchdynamo
 import torch_mlir
 import iree_torch
 
+from shark.shark_inference import SharkInference
+
 COMPILATION_TIMES = []
 COMPILED_ITERATION_TIMES = []
 EAGER_ITERATION_TIMES = []
@@ -103,6 +105,34 @@ def torch_mlir_compiler(fx_graph: torch.fx.GraphModule,
     return forward
 
 
+@timeit(append_time_to=COMPILATION_TIMES)
+def shark_compiler(fx_graph: torch.fx.GraphModule,
+                   example_inputs: List[torch.Tensor], use_tracing: bool):
+    """Compile GraphModule using torch-mlir + IREE."""
+    if _returns_nothing(fx_graph):
+        return fx_graph
+
+    fx_graph_unwrapped = _unwrap_single_tuple_return(fx_graph)
+    was_unwrapped = fx_graph_unwrapped is not None
+    fx_graph = fx_graph_unwrapped if was_unwrapped else fx_graph
+    ts_compiler = torch.jit.trace if use_tracing else torch.jit.script
+    ts_graph = ts_compiler(fx_graph, example_inputs)
+    linalg_module = torch_mlir.compile(ts_graph, example_inputs,
+                                       output_type=torch_mlir.OutputType.LINALG_ON_TENSORS)
+    #compiled_module = iree_torch.compile_to_vmfb(linalg_module, target_backend='cuda')
+    #loaded_module = iree_torch.load_vmfb(compiled_module, backend='cuda')
+    shark_module = SharkInference(str(linalg_module), "forward", mlir_dialect="linalg", device="cuda")
+    shark_module.compile()
+    def forward(*inputs):
+        #result = loaded_module.forward(*inputs)
+        numpy_inputs = [x.numpy() for x in inputs]
+        result = shark_module.forward(numpy_inputs)
+        result = tuple() if result is None else result
+        results = (result,) if was_unwrapped else result
+        return tuple([torch.from_numpy(x) for x in results])
+    return forward
+
+
 def run(func: Callable[[], List[torch.Tensor]], num_iter):
     """Run a function a number of times."""
     results = []
@@ -166,10 +196,13 @@ def main():
         """
         return torch_mlir_compiler(graph, inputs, args.trace)
 
+    #from transformers import AutoModelForSequenceClassification
+    #model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2, torchscript=True)
     @timeit(append_time_to=COMPILED_ITERATION_TIMES)
     def run_model_compiled():
         with torchdynamo.optimize(torchdynamo_torch_mlir_compiler):
             return list(model.invoke())
+            #return list(model.forward(torch.randint(10, (1, 512))))
 
     total_iters = args.warmup_iters + args.iters
     if not args.eager:
